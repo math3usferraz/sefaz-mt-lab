@@ -23,7 +23,8 @@ from DrissionPage import ChromiumOptions, ChromiumPage
 
 from extrair_chaves import chave_valida, extrair_do_arquivo, salvar_csv
 from main import aguardar_liberacao_portal, aguardando_download
-from sefaz_login import LOGIN, autenticar_contribuinte, titulo_sem_espera, url_sem_espera
+from sefaz_login import (LOGIN, autenticar_contribuinte, configurar_certificado_no_perfil,
+                         titulo_sem_espera, url_sem_espera)
 
 
 RAIZ = Path(__file__).resolve().parent
@@ -306,8 +307,10 @@ def main() -> int:
     parser.add_argument("--tipo", choices=["emitidas", "recebidas", "ambas"], default="ambas")
     parser.add_argument("--tentativas-login", type=int, default=0,
                         help="0 repete ate o portal responder; outro valor limita os envios")
-    parser.add_argument("--tentativas-certificado", type=int, default=0,
-                        help="0 repete a selecao do A1 ate o formulario abrir")
+    parser.add_argument("--tentativas-certificado", type=int, default=6,
+                        help="Limite de selecoes do A1; 0 repete sem limite")
+    parser.add_argument("--sem-autoselecao-certificado", action="store_true",
+                        help="Nao grava a auto-selecao do A1 no perfil; usa apenas a janela nativa")
     parser.add_argument("--timeout-download", type=int, default=180)
     parser.add_argument("--porta", type=int, default=9331)
     parser.add_argument("--perfil", default="", help="Perfil Chrome existente dentro de saida/perfis")
@@ -343,6 +346,11 @@ def main() -> int:
         teste_porta.settimeout(1)
         if teste_porta.connect_ex(('127.0.0.1', args.porta)) == 0:
             parser.error('Porta de depuracao ja esta em uso; escolha outra com --porta')
+    # Antes de abrir o Chrome: com o CN do A1 nas preferencias do perfil, o
+    # navegador entrega o certificado sem a janela nativa de selecao (onde a
+    # execucao pelo terminal travava).
+    if not args.sem_autoselecao_certificado:
+        configurar_certificado_no_perfil(perfil, args.cnpj)
     opcoes = ChromiumOptions()
     opcoes.set_timeouts(base=10, page_load=10, script=10)
     opcoes.set_local_port(args.porta)

@@ -1,12 +1,17 @@
 """Login autorizado no Acesso Web com A1 instalado no Windows.
 
-O certificado e escolhido na janela nativa do Chrome por UI Automation. Nenhum
-arquivo PFX ou senha e lido por este modulo.
+Caminho principal: o perfil Chrome recebe a preferencia auto_select_certificate
+com o CN do A1, e o Chrome entrega o certificado sem abrir a janela nativa.
+Fallback: a janela nativa e confirmada por UI Automation. Nenhum arquivo PFX
+ou senha e lido por este modulo.
 """
 from __future__ import annotations
 
 from pathlib import Path
 from itertools import count
+import base64
+import json
+import os
 import re
 import subprocess
 import time
@@ -15,6 +20,114 @@ from DrissionPage.errors import ContextLostError, ElementLostError, WaitTimeoutE
 
 RAIZ = Path(__file__).resolve().parent
 LOGIN = "https://www.sefaz.mt.gov.br/acesso/pages/login/login.xhtml"
+# Padrao de conteudo do Chrome: o host e todos os subdominios, so HTTPS.
+PADRAO_SEFAZ = "https://[*.]sefaz.mt.gov.br"
+# Bypass vale so para este processo. RemoteSigned recusa .ps1 extraido de um
+# .zip baixado (marca "da internet"), e o erro ficava invisivel: o login
+# parecia travado no certificado.
+POWERSHELL = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]
+
+
+def resumo_erro_powershell(resultado) -> str:
+    """Primeiras linhas uteis do stderr/stdout do PowerShell, sem identificadores."""
+    texto = (getattr(resultado, 'stderr', '') or '') + '\n' + (getattr(resultado, 'stdout', '') or '')
+    linhas = [linha.strip() for linha in texto.splitlines()
+              if linha.strip() and not linha.strip().startswith(('+', 'At ', 'No ', '~'))]
+    if not linhas:
+        return f'codigo {getattr(resultado, "returncode", "?")}, sem mensagem'
+    erros = [linha[5:].strip() for linha in linhas if linha.startswith('ERRO:')]
+    if erros:
+        linhas = erros + [linha for linha in linhas if linha.startswith('Itens do dialogo')]
+    return re.sub(r"\d{9,14}", "[identificador]", ' / '.join(linhas[:2])[:400])
+
+
+def nome_certificado_a1(cnpj: str, executar=subprocess.run) -> str | None:
+    """CN do A1 valido do CNPJ no repositorio pessoal do Windows, ou None.
+
+    Somente leitura (nome_certificado.ps1); falha nao e fatal porque o fallback
+    pela janela nativa continua disponivel.
+    """
+    if not re.fullmatch(r"\d{14}", cnpj):
+        raise ValueError("CNPJ deve ter 14 digitos.")
+    if os.name != 'nt':
+        return None
+    comando = POWERSHELL + [str(RAIZ / "nome_certificado.ps1"), "-Cnpj", cnpj]
+    try:
+        resultado = executar(comando, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f'Nome do A1 nao lido ({type(exc).__name__}); usando a janela do Chrome.', flush=True)
+        return None
+    saida = getattr(resultado, 'stdout', '') or ''
+    achado = re.search(r"CN_BASE64:([A-Za-z0-9+/=]+)", saida)
+    if resultado.returncode != 0 or not achado:
+        print(f'Nome do A1 nao lido: {resumo_erro_powershell(resultado)}', flush=True)
+        return None
+    for aviso in re.findall(r"AVISO_[A-Z0-9_]+", saida):
+        print(f'Certificado: {aviso}', flush=True)
+    nome = base64.b64decode(achado.group(1)).decode('utf-8')
+    if not nome.endswith(f':{cnpj}'):
+        raise RuntimeError('CN devolvido nao corresponde ao CNPJ pedido.')
+    return nome
+
+
+def preparar_perfil_certificado(perfil: Path, nome_certificado: str,
+                                padrao: str = PADRAO_SEFAZ) -> Path:
+    """Grava a auto-selecao do A1 nas preferencias do perfil Chrome.
+
+    Equivale a politica AutoSelectCertificateForUrls, porem restrita ao perfil
+    desta execucao: o Chrome entrega ao portal o certificado com esse CN sem
+    abrir a janela "Selecione um certificado" (onde a execucao travava) e sem
+    alterar o registro do Windows nem o Chrome do dia a dia. Deve ser chamada
+    com o Chrome fechado para esse perfil.
+    """
+    if not nome_certificado or ':' not in nome_certificado:
+        raise ValueError('Nome de certificado invalido.')
+    arquivo = Path(perfil) / 'Default' / 'Preferences'
+    arquivo.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        dados = json.loads(arquivo.read_text(encoding='utf-8')) if arquivo.exists() else {}
+    except (OSError, ValueError) as exc:
+        raise RuntimeError('Preferences do perfil Chrome ilegivel; use um perfil novo.') from exc
+    if not isinstance(dados, dict):
+        raise RuntimeError('Preferences do perfil Chrome em formato inesperado.')
+    excecoes = (dados.setdefault('profile', {}).setdefault('content_settings', {})
+                .setdefault('exceptions', {}))
+    regras = excecoes.setdefault('auto_select_certificate', {})
+    regras[f'{padrao},*'] = {'setting': {'filters': [{'SUBJECT': {'CN': nome_certificado}}]}}
+    temporario = arquivo.with_name('Preferences.tmp')
+    temporario.write_text(json.dumps(dados, ensure_ascii=False), encoding='utf-8')
+    os.replace(temporario, arquivo)
+    return arquivo
+
+
+def configurar_certificado_no_perfil(perfil: Path, cnpj: str, executar=subprocess.run) -> bool:
+    """Le o CN do A1 e prepara o perfil. Retorna False se cair no fallback."""
+    nome = nome_certificado_a1(cnpj, executar=executar)
+    if not nome:
+        return False
+    preparar_perfil_certificado(perfil, nome)
+    print('Auto-selecao do A1 gravada no perfil Chrome desta execucao.', flush=True)
+    return True
+
+
+def aguardar_saida_do_login(pagina, espera: float) -> str | None:
+    """Espera a navegacao causada pelo clique no link do certificado.
+
+    Retorna ``'certificado'``, ``'inicial'`` ou ``None`` se a pagina continuou
+    no login (janela nativa aberta ou portal lento).
+    """
+    limite = time.monotonic() + espera
+    while True:
+        url = url_sem_espera(pagina)
+        if "/acesso/pages/paginainicial.xhtml" in url:
+            return 'inicial'
+        if "login-certificado.xhtml" in url:
+            return 'certificado'
+        if "captcha" in titulo_sem_espera(pagina).lower():
+            raise RuntimeError("Desafio de seguranca detectado apos selecionar certificado.")
+        if time.monotonic() >= limite:
+            return None
+        time.sleep(0.5)
 
 
 def url_sem_espera(pagina) -> str:
@@ -189,7 +302,8 @@ def enviar_login_com_retentativas(pagina, ie: str, tentativas: int = 8, interval
 
 
 def autenticar_contribuinte(pagina, cnpj: str, ie: str, timeout: int = 45,
-                            tentativas: int = 8, tentativas_certificado: int = 5) -> int:
+                            tentativas: int = 8, tentativas_certificado: int = 5,
+                            espera_politica: float = 8) -> int:
     """Autentica um contribuinte pelo formulario real observado em 13/11/2026."""
     if not re.fullmatch(r"\d{14}", cnpj):
         raise ValueError("CNPJ deve ter 14 digitos.")
@@ -197,7 +311,10 @@ def autenticar_contribuinte(pagina, cnpj: str, ie: str, timeout: int = 45,
         raise ValueError("IE deve conter somente digitos (8 a 14).")
     if tentativas_certificado < 0:
         raise ValueError("Tentativas de certificado nao pode ser negativa.")
-    browser_pid = int(pagina.process_id)
+    try:
+        browser_pid = int(pagina.process_id or 0)
+    except (TypeError, ValueError):
+        browser_pid = 0
     if browser_pid <= 0:
         raise RuntimeError('PID do Chrome não identificado; não é seguro escolher o certificado.')
 
@@ -276,20 +393,38 @@ def autenticar_contribuinte(pagina, cnpj: str, ie: str, timeout: int = 45,
             print(f'{estado} por 10 s; mantendo a sessao {numero}/{limite_texto}.', flush=True)
             continue
         limite_texto = 'sem limite' if tentativas_certificado == 0 else str(tentativas_certificado)
-        print(f"Selecao do certificado: tentativa {numero}/{limite_texto}.", flush=True)
+        # Com a auto-selecao no perfil o Chrome nao abre a janela
+        # do A1 e a navegacao segue sozinha; so recorre ao UI Automation se a
+        # pagina continuar parada no login.
+        destino = aguardar_saida_do_login(pagina, espera_politica)
+        if destino == 'inicial':
+            return 0
+        if destino == 'certificado':
+            print('A1 entregue pelo Chrome sem janela de selecao.', flush=True)
+            if formulario_certificado_visivel(pagina):
+                formulario_pronto = True
+                break
+            print(f'Formulario do certificado vazio apos 10 s; mantendo a sessao {numero}/{limite_texto}.', flush=True)
+            continue
+        print(f"Selecao do certificado pela janela do Chrome: tentativa {numero}/{limite_texto}.", flush=True)
         try:
             resultado = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "RemoteSigned", "-File", str(helper),
-                 "-Cnpj", cnpj, "-BrowserPid", str(browser_pid), "-TimeoutSegundos", "10"],
-                capture_output=True, text=True, timeout=15,
+                POWERSHELL + [str(helper), "-Cnpj", cnpj, "-BrowserPid", str(browser_pid),
+                              "-TimeoutSegundos", "20"],
+                capture_output=True, text=True, timeout=35,
             )
         except subprocess.TimeoutExpired:
             resultado = None
+        except OSError as exc:
+            # powershell.exe ausente/bloqueado: registra e segue verificando a pagina.
+            resultado = subprocess.CompletedProcess([], 1, '', f'PowerShell nao executou: {type(exc).__name__}')
         if (resultado is not None and resultado.returncode == 0 and
                 'CERTIFICADO_CONFIRMADO' in (getattr(resultado, 'stdout', '') or '')):
             print('A1 selecionado; OK da janela do Chrome acionado.', flush=True)
+        elif resultado is None:
+            print('Seletor do A1 nao respondeu em 35 s; verificando navegacao antes de repetir.', flush=True)
         else:
-            print('Janela do A1 ainda nao confirmou OK; verificando navegacao antes de repetir.', flush=True)
+            print(f'Janela do A1 nao confirmada: {resumo_erro_powershell(resultado)}', flush=True)
         limite_navegacao = time.monotonic() + (10 if resultado is not None and resultado.returncode == 0 else 1)
         while time.monotonic() < limite_navegacao:
             if "login-certificado.xhtml" in url_sem_espera(pagina):

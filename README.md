@@ -10,6 +10,30 @@ cd C:\Users\Matheus\Desktop\sefaz-mt-lab-v3\sefaz-mt-lab-v3
 .\.venv\Scripts\python.exe coletar_nfe.py --cnpj 12345678000199 --ie 123456789 --inicio 01/10/2026 --fim 31/10/2026 --tipo ambas --tentativas-login 15 --tentativas-certificado 6
 ```
 
+### Certificado A1 sem a janela "Selecione um certificado"
+
+Antes de abrir o Chrome, a rotina lê (somente leitura) o nome do A1 do CNPJ no
+repositório pessoal do Windows com `nome_certificado.ps1` e grava esse nome na
+preferência `auto_select_certificate` do **perfil Chrome desta execução**. Assim
+o Chrome entrega o certificado ao portal `https://[*.]sefaz.mt.gov.br` sem abrir
+a janela nativa — era nela que a execução pelo terminal travava. Nada é gravado
+no registro do Windows nem no Chrome do dia a dia, e nenhuma chave privada é
+exportada. Se o nome não puder ser lido, a rotina volta ao caminho antigo
+(`certificado_chrome.ps1`, UI Automation) e agora mostra o motivo da falha.
+
+Os scripts PowerShell são chamados com `-ExecutionPolicy Bypass` (somente para
+o processo filho). Antes, `RemoteSigned` recusava os `.ps1` vindos de um `.zip`
+baixado da internet e o erro não aparecia. Para conferir o ambiente:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\diagnosticar_certificado.ps1 -Cnpj 12345678000199
+```
+
+Mensagens esperadas no login: `Auto-selecao do A1 gravada no perfil Chrome desta execucao.`
+e depois `A1 entregue pelo Chrome sem janela de selecao.` Para forçar o caminho
+antigo, use `--sem-autoselecao-certificado`. `--tentativas-certificado` agora
+vale 6 por padrão (0 continua significando sem limite).
+
 O Cloudflare pode liberar o acesso automaticamente; caso apresente um desafio
 que exija uma pessoa, a rotina aguarda até 120 segundos sem solucioná-lo.
 Por padrão, o Chrome usa um perfil novo isolado por execução em `saida/perfis/`.
@@ -96,7 +120,7 @@ Para isolar a etapa de autenticação com o A1 instalado no Windows, execute no 
 python main.py --etapa login --login-automatico --cnpj 00000000000000 --ie 000000000 --perfil-temporario
 ```
 
-O script só confirma sucesso se a URL autenticada do Acesso Web for exibida. Se o portal retornar ao formulário, a tentativa termina com falha e não coleta chaves. O seletor nativo do Chrome é confirmado por `certificado_chrome.ps1` apenas quando encontra exatamente um certificado com o CNPJ pedido. Nenhum PFX ou senha é lido pela rotina.
+O script só confirma sucesso se a URL autenticada do Acesso Web for exibida. Se o portal retornar ao formulário, a tentativa termina com falha e não coleta chaves. O A1 é escolhido pela preferência de auto-seleção do perfil (CN terminado em `:<CNPJ>`, exatamente um nome válido); só se ela não puder ser gravada o seletor nativo do Chrome é confirmado por `certificado_chrome.ps1`, apenas quando encontra exatamente um certificado com o CNPJ pedido. Nenhum PFX ou senha é lido pela rotina.
 
 O portal pode permanecer no mesmo formulário após um envio sem apresentar erro. Nesse caso, a rotina faz no máximo 8 envios com intervalo de 5 segundos e interrompe ao receber uma mensagem de erro ou desafio de segurança. Para reduzir o limite, use `--tentativas-login 3`. O diagnóstico de falha de login registra JSON sem captura de tela do campo de IE.
 
