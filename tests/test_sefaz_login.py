@@ -1,8 +1,12 @@
 import unittest
+from pathlib import Path
+from itertools import count
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from sefaz_login import (autenticar_contribuinte, enviar_login_com_retentativas,
+                         resumo_erro_powershell,
+                         aguardar_saida_do_login,
                          clicar_css_sem_espera, formulario_certificado_visivel,
                          estado_formulario_login_sem_espera, botao_login_visivel, url_sem_espera)
 
@@ -121,7 +125,7 @@ class TestLoginLimitado(unittest.TestCase):
                 return 'CONTRIBUINTE_MT' if 'selectTipoUsuario_input' in script else self.ie_digitada
 
         pagina = Pagina()
-        relogio = iter(range(0, 300, 11))
+        relogio = count(0, 11)
         with patch('sefaz_login.subprocess.run', return_value=SimpleNamespace(
                 returncode=0, stdout='CERTIFICADO_CONFIRMADO')) as helper, \
                 patch('sefaz_login.formulario_certificado_visivel', return_value=True), \
@@ -129,8 +133,11 @@ class TestLoginLimitado(unittest.TestCase):
                 patch('sefaz_login.time.sleep'):
             autenticar_contribuinte(pagina, '12345678000199', '123456789', tentativas_certificado=3)
         self.assertEqual(pagina.cliques_certificado, 2)
-        self.assertEqual(helper.call_count, 2)
-        self.assertIn('1234', helper.call_args.args[0])
+        # 1o clique nao navegou: usa a janela; 2o navegou sozinho (politica).
+        self.assertEqual(helper.call_count, 1)
+        comando = helper.call_args.args[0]
+        self.assertIn('1234', comando)
+        self.assertEqual(comando[comando.index('-ExecutionPolicy') + 1], 'Bypass')
 
     def test_redirecionamento_entre_duas_leituras_da_url(self):
         class PaginaComRedirecionamento:
@@ -236,6 +243,135 @@ class TestLoginLimitado(unittest.TestCase):
         pagina = PaginaFalsa()
         with patch('sefaz_login.botao_login_visivel', return_value=Botao()):
             self.assertEqual(enviar_login_com_retentativas(pagina, '123456789', 3, 0), 0)
+
+
+class TestAutoSelecaoCertificado(unittest.TestCase):
+    CN = 'EMPRESA TESTE LTDA:12345678000199'
+
+    def _saida(self, nome=None, extra=''):
+        import base64
+        nome = nome or self.CN
+        return SimpleNamespace(returncode=0, stderr='', stdout=extra +
+                               'CN_BASE64:' + base64.b64encode(nome.encode()).decode() + '\n')
+
+    def test_nome_usa_bypass_e_decodifica_utf8(self):
+        chamado = {}
+        nome = 'ACME \u00c1GUA LTDA:12345678000199'
+
+        def executar(comando, **kwargs):
+            chamado['comando'] = comando
+            return self._saida(nome)
+
+        from sefaz_login import nome_certificado_a1
+        with patch('sefaz_login.os.name', 'nt'):
+            self.assertEqual(nome_certificado_a1('12345678000199', executar=executar), nome)
+        comando = chamado['comando']
+        self.assertEqual(comando[comando.index('-ExecutionPolicy') + 1], 'Bypass')
+        self.assertTrue(comando[comando.index('-File') + 1].endswith('nome_certificado.ps1'))
+        self.assertEqual(comando[comando.index('-Cnpj') + 1], '12345678000199')
+
+    def test_nome_de_outro_cnpj_e_recusado(self):
+        from sefaz_login import nome_certificado_a1
+        with patch('sefaz_login.os.name', 'nt'):
+            with self.assertRaisesRegex(RuntimeError, 'nao corresponde'):
+                nome_certificado_a1('12345678000199',
+                                    executar=lambda *a, **k: self._saida('OUTRA:99999999000191'))
+
+    def test_falha_nao_e_fatal_e_mostra_motivo_sem_cnpj(self):
+        from sefaz_login import nome_certificado_a1
+
+        def executar(comando, **kwargs):
+            return SimpleNamespace(returncode=1, stdout='', stderr=(
+                'Nenhum A1 com chave privada para 12345678000199.\n'
+                'At C:\\x\\nome_certificado.ps1:25 char:5\n'
+                '+     throw ...\n'))
+
+        with patch('sefaz_login.os.name', 'nt'), patch('builtins.print') as saida:
+            self.assertIsNone(nome_certificado_a1('12345678000199', executar=executar))
+        impresso = ' '.join(str(c.args[0]) for c in saida.call_args_list)
+        self.assertIn('Nenhum A1', impresso)
+        self.assertNotIn('12345678000199', impresso)
+
+    def test_fora_do_windows_nao_executa(self):
+        from sefaz_login import nome_certificado_a1
+
+        def executar(*_a, **_k):
+            raise AssertionError('nao deveria chamar o PowerShell')
+
+        with patch('sefaz_login.os.name', 'posix'):
+            self.assertIsNone(nome_certificado_a1('12345678000199', executar=executar))
+
+    def test_preferencia_em_perfil_novo(self):
+        import json
+        import tempfile
+        from sefaz_login import preparar_perfil_certificado
+        with tempfile.TemporaryDirectory() as pasta:
+            arquivo = preparar_perfil_certificado(Path(pasta), self.CN)
+            dados = json.loads(arquivo.read_text(encoding='utf-8'))
+        regras = dados['profile']['content_settings']['exceptions']['auto_select_certificate']
+        self.assertEqual(regras, {'https://[*.]sefaz.mt.gov.br,*': {
+            'setting': {'filters': [{'SUBJECT': {'CN': self.CN}}]}}})
+
+    def test_preferencia_preserva_perfil_existente_e_troca_empresa(self):
+        import json
+        import tempfile
+        from sefaz_login import preparar_perfil_certificado
+        with tempfile.TemporaryDirectory() as pasta:
+            arquivo = Path(pasta) / 'Default' / 'Preferences'
+            arquivo.parent.mkdir()
+            arquivo.write_text(json.dumps({'browser': {'x': 1}, 'profile': {'content_settings': {
+                'exceptions': {'cookies': {'a,*': {}}, 'auto_select_certificate': {
+                    'https://outro.example,*': {'setting': {'filters': []}}}}}}}), encoding='utf-8')
+            preparar_perfil_certificado(Path(pasta), 'OUTRA:99999999000191')
+            preparar_perfil_certificado(Path(pasta), self.CN)
+            dados = json.loads(arquivo.read_text(encoding='utf-8'))
+        self.assertEqual(dados['browser'], {'x': 1})
+        excecoes = dados['profile']['content_settings']['exceptions']
+        self.assertIn('cookies', excecoes)
+        regras = excecoes['auto_select_certificate']
+        self.assertIn('https://outro.example,*', regras)
+        self.assertEqual(regras['https://[*.]sefaz.mt.gov.br,*']['setting']['filters'],
+                         [{'SUBJECT': {'CN': self.CN}}])
+
+    def test_configurar_no_perfil_cai_no_fallback_sem_nome(self):
+        import tempfile
+        from sefaz_login import configurar_certificado_no_perfil
+        with tempfile.TemporaryDirectory() as pasta, patch('sefaz_login.os.name', 'posix'):
+            self.assertFalse(configurar_certificado_no_perfil(Path(pasta), '12345678000199'))
+            self.assertFalse((Path(pasta) / 'Default' / 'Preferences').exists())
+
+    def test_resumo_ignora_linhas_de_pilha(self):
+        resultado = SimpleNamespace(returncode=1, stdout='', stderr=(
+            'File C:\\x\\certificado_chrome.ps1 cannot be loaded. The file is not digitally signed.\n'
+            '    + CategoryInfo          : SecurityError\n'))
+        self.assertIn('not digitally signed', resumo_erro_powershell(resultado))
+
+    def test_aguardar_saida_detecta_navegacao_automatica(self):
+        class Pagina:
+            leituras = 0
+            title = 'AcessoWeb'
+
+            @property
+            def url(self):
+                self.leituras += 1
+                if self.leituras < 3:
+                    return 'https://www.sefaz.mt.gov.br/acesso/pages/login/login.xhtml'
+                return 'https://www.sefaz.mt.gov.br/acesso/pages/login-certificado/login-certificado.xhtml'
+
+        relogio = count(0, 1)
+        with patch('sefaz_login.time.monotonic', side_effect=lambda: next(relogio)), \
+                patch('sefaz_login.time.sleep'):
+            self.assertEqual(aguardar_saida_do_login(Pagina(), 8), 'certificado')
+
+    def test_aguardar_saida_desiste_no_prazo(self):
+        class Pagina:
+            url = 'https://www.sefaz.mt.gov.br/acesso/pages/login/login.xhtml'
+            title = 'AcessoWeb'
+
+        relogio = count(0, 1)
+        with patch('sefaz_login.time.monotonic', side_effect=lambda: next(relogio)), \
+                patch('sefaz_login.time.sleep'):
+            self.assertIsNone(aguardar_saida_do_login(Pagina(), 5))
 
 
 if __name__ == "__main__":

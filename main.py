@@ -157,6 +157,10 @@ def executar(args) -> int:
     perfil = criar_pasta_download_execucao(SAIDA / "perfis") if args.perfil_temporario else PERFIL
     perfil.mkdir(parents=True, exist_ok=True)
 
+    if args.login_automatico:
+        # Auto-selecao do A1 no perfil: evita a janela nativa do certificado.
+        from sefaz_login import configurar_certificado_no_perfil
+        configurar_certificado_no_perfil(perfil, args.cnpj)
     opcoes = ChromiumOptions()
     if args.chrome:
         opcoes.set_browser_path(args.chrome)
